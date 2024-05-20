@@ -39,6 +39,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
 
 /* pad templates */
 static GstStaticPadTemplate gst_perf_src_template =
@@ -58,6 +60,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_perf_debug);
 #define GST_CAT_DEFAULT gst_perf_debug
 
 #define DEFAULT_PRINT_CPU_LOAD    FALSE
+#define DEFAULT_GPU_STATS_ENABLED    FALSE
 #define DEFAULT_BITRATE_WINDOW_SIZE    0
 #define DEFAULT_BITRATE_INTERVAL    1000
 
@@ -66,6 +69,7 @@ enum
   PROP_0,
   PROP_PRINT_ARM_LOAD,
   PROP_PRINT_CPU_LOAD,
+  PROP_GPU_STATS_ENABLED,
   PROP_BITRATE_WINDOW_SIZE,
   PROP_BITRATE_INTERVAL
 };
@@ -73,7 +77,7 @@ enum
 /* GstPerf signals and args */
 enum
 {
-  SIGNAL_ON_BITRATE,
+  SIGNAL_ON_STATS,
   LAST_SIGNAL
 };
 
@@ -107,8 +111,21 @@ struct _GstPerf
   guint32 prev_cpu_total;
   guint32 prev_cpu_idle;
 
+  // GPU Stats - 
+  struct {
+    guint encoder_utilization;
+    guint session_count;
+    guint average_fps;
+    guint64 average_latency;
+    guint gpu_utilization;
+    guint memory_used;
+    guint memory_free;
+  } gpu_stats;
+  
+
   /* Properties */
   gboolean print_cpu_load;
+  gboolean gpu_stats_enabled;
 };
 
 struct _GstPerfClass
@@ -146,6 +163,7 @@ static double
 gst_perf_update_moving_average (guint64 window_size, gdouble old_average,
     gdouble new_sample, gdouble old_sample);
 static gboolean gst_perf_update_bps (void *data);
+static gboolean gst_perf_get_gpu_stats(GstPerf * perf);
 static gboolean gst_perf_cpu_get_load (GstPerf * perf, guint32 * cpu_load);
 static guint32 gst_perf_compute_cpu (GstPerf * perf, guint32 idle,
     guint32 total);
@@ -172,6 +190,11 @@ gst_perf_class_init (GstPerfClass * klass)
       g_param_spec_boolean ("print-cpu-load", "Print CPU load",
           "Print the CPU load info.", DEFAULT_PRINT_CPU_LOAD,
           G_PARAM_WRITABLE));
+  
+  g_object_class_install_property (gobject_class, PROP_GPU_STATS_ENABLED,
+      g_param_spec_boolean ("gpu-stats-enabled", "Gather GPU Stats",
+          "Gather GPU Stats for signal callback.", DEFAULT_GPU_STATS_ENABLED,
+          G_PARAM_WRITABLE));
 
   g_object_class_install_property (gobject_class, PROP_BITRATE_WINDOW_SIZE,
       g_param_spec_uint ("bitrate-window-size",
@@ -185,9 +208,12 @@ gst_perf_class_init (GstPerfClass * klass)
           "Interval between two calculations in ms, this will run even when no buffers are received",
           0, G_MAXINT, DEFAULT_BITRATE_INTERVAL, G_PARAM_WRITABLE));
 
-  gst_perf_signals[SIGNAL_ON_BITRATE] =
-      g_signal_new ("on-bitrate", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_DOUBLE);
+  gst_perf_signals[SIGNAL_ON_STATS] =
+      g_signal_new ("on-stats", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 12, 
+      G_TYPE_DOUBLE, G_TYPE_DOUBLE, G_TYPE_DOUBLE, G_TYPE_DOUBLE,
+      G_TYPE_UINT, G_TYPE_UINT, G_TYPE_UINT, G_TYPE_UINT,
+      G_TYPE_UINT64, G_TYPE_UINT, G_TYPE_UINT, G_TYPE_UINT);
 
   base_transform_class->start = GST_DEBUG_FUNCPTR (gst_perf_start);
   base_transform_class->stop = GST_DEBUG_FUNCPTR (gst_perf_stop);
@@ -211,6 +237,7 @@ gst_perf_init (GstPerf * perf)
   gst_perf_clear (perf);
 
   perf->print_cpu_load = DEFAULT_PRINT_CPU_LOAD;
+  perf->gpu_stats_enabled = DEFAULT_GPU_STATS_ENABLED;
   perf->bps_window_size = DEFAULT_BITRATE_WINDOW_SIZE;
   perf->bps_interval = DEFAULT_BITRATE_INTERVAL;
   perf->bps_running_interval = DEFAULT_BITRATE_INTERVAL;
@@ -249,6 +276,11 @@ gst_perf_set_property (GObject * object, guint property_id,
       perf->bps_interval = g_value_get_uint (value);
       GST_OBJECT_UNLOCK (perf);
       break;
+    case PROP_GPU_STATS_ENABLED:
+      GST_OBJECT_LOCK (perf);
+      perf->gpu_stats_enabled = g_value_get_boolean (value);
+      GST_OBJECT_UNLOCK (perf);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -278,6 +310,11 @@ gst_perf_get_property (GObject * object, guint property_id,
     case PROP_BITRATE_INTERVAL:
       GST_OBJECT_LOCK (perf);
       g_value_set_uint (value, perf->bps_interval);
+      GST_OBJECT_UNLOCK (perf);
+      break;
+    case PROP_GPU_STATS_ENABLED:
+      GST_OBJECT_LOCK (perf);
+      g_value_set_boolean (value, perf->gpu_stats_enabled);
       GST_OBJECT_UNLOCK (perf);
       break;
     default:
@@ -339,8 +376,6 @@ gst_perf_update_bps (void *data)
 
   perf->byte_count_total++;
 
-  g_signal_emit_by_name (perf, "on-bitrate", mean_bps);
-
   return TRUE;
 }
 
@@ -366,7 +401,6 @@ gst_perf_start (GstBaseTransform * trans)
 
   perf->bps_source_id =
       g_timeout_add (perf->bps_interval, gst_perf_update_bps, perf);
-
   perf->error = g_error_new (GST_CORE_ERROR,
       GST_CORE_ERROR_TAG, "Performance Information");
   return TRUE;
@@ -430,6 +464,63 @@ gst_perf_compute_cpu (GstPerf * self, guint32 current_idle,
 }
 
 #ifdef IS_LINUX
+
+static gboolean
+gst_perf_get_gpu_stats(GstPerf * perf)
+{
+  gboolean ret = FALSE;
+  gchar *cmd = "nvidia-smi --format=csv,noheader --query-gpu="
+  "utilization.encoder,encoder.stats.sessionCount,encoder.stats.averageFps,"
+  "encoder.stats.averageLatency,utilization.gpu,memory.used,memory.free";
+  gchar *output = NULL;
+  gint exit_status = 0;
+  gchar *token = NULL;
+
+  g_return_val_if_fail (perf, FALSE);
+
+  ret = g_spawn_command_line_sync (cmd, &output, NULL, &exit_status, NULL);
+  if (ret && exit_status == 0) {
+    // Ohh how I so miss C...
+    token = strtok(output, ",");
+    for (int i = 0; token != NULL; i++) {
+        guint64 number = atol(token);
+        switch(i) {
+            case 0:
+                perf->gpu_stats.encoder_utilization = (guint) number;                
+                break;
+            case 1:
+
+                perf->gpu_stats.session_count = (guint) number;
+                break;
+            case 2:
+
+                perf->gpu_stats.average_fps = (guint) number;
+                break;
+            case 3:
+                perf->gpu_stats.average_latency = number;
+                break;
+            case 4:
+                perf->gpu_stats.gpu_utilization = (guint) number;
+                break;
+            case 5:
+                perf->gpu_stats.memory_used = (guint) number;
+                break;
+            case 6:
+                perf->gpu_stats.memory_free = (guint) number;
+                break;
+            default:
+                break;
+        }
+        token = strtok(NULL, ",");
+    }
+    g_free (output);
+  } else {
+    GST_ERROR_OBJECT (perf, "Failed to get GPU stats");
+  }
+
+  return ret;
+}
+
 static gboolean
 gst_perf_cpu_get_load (GstPerf * perf, guint32 * cpu_load)
 {
@@ -441,7 +532,7 @@ gst_perf_cpu_get_load (GstPerf * perf, guint32 * cpu_load)
 
   g_return_val_if_fail (perf, FALSE);
   g_return_val_if_fail (cpu_load, FALSE);
-
+  
   /* Default value in case of failure */
   *cpu_load = -1;
 
@@ -474,7 +565,6 @@ gst_perf_cpu_get_load (GstPerf * perf, guint32 * cpu_load)
   total = user + nice + sys + idle + iowait + irq + softirq + steal;
 
   *cpu_load = gst_perf_compute_cpu (perf, idle, total);
-
   return TRUE;
 
 cpu_failed:
@@ -577,17 +667,28 @@ gst_perf_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     print_cpu_load = perf->print_cpu_load;
     GST_OBJECT_UNLOCK (perf);
 
+    guint32 cpu_load = 0;
+    gst_perf_cpu_get_load (perf, &cpu_load);
     if (print_cpu_load) {
-      guint32 cpu_load;
-      gst_perf_cpu_get_load (perf, &cpu_load);
       idx = g_snprintf (&info[idx], GST_PERF_MSG_MAX_SIZE - idx,
           "; cpu: %d; ", cpu_load);
+    }
+
+    if (perf->gpu_stats_enabled) {
+      gst_perf_get_gpu_stats(perf);
     }
 
     gst_element_post_message (
         (GstElement *) perf,
         gst_message_new_info ((GstObject *) perf, perf->error,
             (const gchar *) info));
+
+    g_signal_emit_by_name (perf, "on-stats", 
+      fps, perf->fps, perf->bps, perf->mean_bps, cpu_load,
+      perf->gpu_stats.encoder_utilization, perf->gpu_stats.session_count,
+      perf->gpu_stats.average_fps, perf->gpu_stats.average_latency,
+      perf->gpu_stats.gpu_utilization, perf->gpu_stats.memory_used,
+      perf->gpu_stats.memory_free);
 
     GST_INFO_OBJECT (perf, "%s", info);
   }
@@ -596,6 +697,8 @@ gst_perf_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   g_mutex_lock (&perf->byte_count_mutex);
   perf->byte_count += gst_buffer_get_size (buf);
   g_mutex_unlock (&perf->byte_count_mutex);
+
+  gst_perf_update_bps (perf);
 
   return GST_FLOW_OK;
 }
@@ -650,6 +753,8 @@ gst_perf_clear (GstPerf * perf)
   perf->prev_timestamp = GST_CLOCK_TIME_NONE;
   perf->prev_cpu_total = 0;
   perf->prev_cpu_idle = 0;
+
+  memset(&perf->gpu_stats, 0, sizeof(perf->gpu_stats));
 }
 
 static gboolean
